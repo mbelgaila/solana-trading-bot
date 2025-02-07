@@ -164,7 +164,7 @@ const runListener = async () => {
   const quoteToken = getToken(QUOTE_MINT);
   const botConfig = <BotConfig>{
     wallet,
-    quoteAta: getAssociatedTokenAddressSync(quoteToken.mint, wallet.publicKey),
+    quoteAta: quoteToken.symbol === 'SOL' ? wallet.publicKey : getAssociatedTokenAddressSync(quoteToken.mint, wallet.publicKey),
     checkRenounced: CHECK_IF_MINT_IS_RENOUNCED,
     checkFreezable: CHECK_IF_FREEZABLE,
     checkBurned: CHECK_IF_BURNED,

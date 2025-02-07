@@ -91,7 +91,17 @@ export class Bot {
 
   async validate() {
     try {
-      await getAccount(this.connection, this.config.quoteAta, this.connection.commitment);
+      if (this.config.quoteToken.symbol === 'SOL') {
+        const balance = await this.connection.getBalance(this.config.wallet.publicKey);
+        if (balance <= 0) {
+          logger.error(
+            `No SOL found in wallet: ${this.config.wallet.publicKey.toString()}`,
+          );
+          return false;
+        }
+      } else {
+        await getAccount(this.connection, this.config.quoteAta, this.connection.commitment);
+      }
     } catch (error) {
       logger.error(
         `${this.config.quoteToken.symbol} token account not found in wallet: ${this.config.wallet.publicKey.toString()}`,
