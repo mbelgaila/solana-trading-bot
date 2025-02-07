@@ -16,18 +16,22 @@ export class PoolSizeFilter implements Filter {
         const response = await this.connection.getTokenAccountBalance(poolKeys.quoteVault, this.connection.commitment);
         const poolSize = new TokenAmount(this.quoteToken, response.value.amount, true);
 
-        // Vérification de la taille maximale
-        if (!this.maxPoolSize?.isZero() && poolSize.raw.gt(this.maxPoolSize.raw)) {
-            return { ok: false, message: `PoolSize -> Pool size ${poolSize.toFixed()} > ${this.maxPoolSize.toFixed()}` };
+        // Get decimal values for comparison
+        const poolSizeDecimal = parseFloat(poolSize.toFixed());
+        const maxSizeDecimal = parseFloat(this.maxPoolSize.toFixed());
+        const minSizeDecimal = parseFloat(this.minPoolSize.toFixed());
+
+        // Check if pool size is outside the desired range
+        if (poolSizeDecimal > maxSizeDecimal) {
+            return { ok: true, message: `PoolSize -> Pool size ${poolSizeDecimal} > ${maxSizeDecimal}` };
         }
 
-        // Vérification de la taille minimale
-        if (!this.minPoolSize?.isZero() && poolSize.raw.lt(this.minPoolSize.raw)) {
-            return { ok: false, message: `PoolSize -> Pool size ${poolSize.toFixed()} < ${this.minPoolSize.toFixed()}` };
+        if (poolSizeDecimal < minSizeDecimal) {
+            return { ok: true, message: `PoolSize -> Pool size ${poolSizeDecimal} < ${minSizeDecimal}` };
         }
 
-        // Si on arrive ici, les deux conditions sont satisfaites
-        return { ok: true };
+        // If we get here, the pool size is within range (between min and max)
+        return { ok: false, message: `PoolSize -> Pool size ${poolSizeDecimal}` };
     } catch (error) {
         logger.error({ mint: poolKeys.baseMint }, `Failed to check pool size`);
         return { ok: false, message: 'PoolSize -> Failed to check pool size' };
