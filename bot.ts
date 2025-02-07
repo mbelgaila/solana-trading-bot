@@ -60,9 +60,9 @@ export class Bot {
   // snipe list
   private readonly snipeListCache?: SnipeListCache;
 
-  // one token at the time
+  private readonly MAX_CONCURRENT_TOKENS = 5;
+  private activeTokenCount = 0;
   private readonly mutex: Mutex;
-  private sellExecutionCount = 0;
   public readonly isWarp: boolean = false;
   public readonly isJito: boolean = false;
 
@@ -125,17 +125,17 @@ export class Bot {
       await sleep(this.config.autoBuyDelay);
     }
 
-    if (this.config.oneTokenAtATime) {
-      if (this.mutex.isLocked() || this.sellExecutionCount > 0) {
-        logger.debug(
-          { mint: poolState.baseMint.toString() },
-          `Skipping buy because one token at a time is turned on and token is already being processed`,
-        );
-        return;
-      }
-
-      await this.mutex.acquire();
+    await this.mutex.acquire();
+    if (this.activeTokenCount >= this.MAX_CONCURRENT_TOKENS) {
+      logger.debug(
+        { mint: poolState.baseMint.toString() },
+        `Skipping buy because maximum number of concurrent tokens (${this.MAX_CONCURRENT_TOKENS}) is reached`,
+      );
+      this.mutex.release();
+      return;
     }
+    this.activeTokenCount++;
+    this.mutex.release();
 
     try {
       const [market, mintAta] = await Promise.all([
@@ -207,9 +207,9 @@ export class Bot {
   }
 
   public async sell(accountId: PublicKey, rawAccount: RawAccount) {
-    if (this.config.oneTokenAtATime) {
-      this.sellExecutionCount++;
-    }
+    await this.mutex.acquire();
+    this.activeTokenCount = Math.max(0, this.activeTokenCount - 1);
+    this.mutex.release();
 
     try {
       logger.trace({ mint: rawAccount.mint }, `Processing new token...`);
@@ -286,9 +286,9 @@ export class Bot {
     } catch (error) {
       logger.error({ mint: rawAccount.mint.toString(), error }, `Failed to sell token`);
     } finally {
-      if (this.config.oneTokenAtATime) {
-        this.sellExecutionCount--;
-      }
+      await this.mutex.acquire();
+      this.activeTokenCount = Math.max(0, this.activeTokenCount - 1);
+      this.mutex.release();
     }
   }
 
