@@ -3,6 +3,7 @@ import {
   Connection,
   Keypair,
   PublicKey,
+  Transaction,
   TransactionMessage,
   VersionedTransaction,
 } from '@solana/web3.js';
@@ -14,7 +15,8 @@ import {
   RawAccount,
   TOKEN_PROGRAM_ID,
 } from '@solana/spl-token';
-import { Liquidity, LiquidityPoolKeysV4, LiquidityStateV4, Percent, Token, TokenAmount } from '@raydium-io/raydium-sdk';
+import { Liquidity, LiquidityPoolKeysV4, LiquidityStateV4, MAINNET_PROGRAM_ID, Percent, Token, TokenAmount } from '@raydium-io/raydium-sdk';
+import { API_URLS } from '@raydium-io/raydium-sdk-v2';
 import { MarketCache, PoolCache, SnipeListCache } from './cache';
 import { PoolFilters } from './filters';
 import { TransactionExecutor } from './transactions';
@@ -23,6 +25,39 @@ import { Mutex } from 'async-mutex';
 import BN from 'bn.js';
 import { WarpTransactionExecutor } from './transactions/warp-transaction-executor';
 import { JitoTransactionExecutor } from './transactions/jito-rpc-transaction-executor';
+import axios from 'axios';
+
+interface SwapCompute {
+  id: string;
+  success: true;
+  version: 'V0' | 'V1';
+  openTime?: undefined;
+  msg: undefined;
+  data: {
+    swapType: 'BaseIn' | 'BaseOut';
+    inputMint: string;
+    inputAmount: string;
+    outputMint: string;
+    outputAmount: string;
+    otherAmountThreshold: string;
+    slippageBps: number;
+    priceImpactPct: number;
+    routePlan: {
+      poolId: string;
+      inputMint: string;
+      outputMint: string;
+      feeMint: string;
+      feeRate: number;
+      feeAmount: string;
+    }[];
+  };
+}
+
+interface TransactionResult {
+  confirmed: boolean;
+  signature?: string;
+  error?: unknown;
+}
 
 export interface BotConfig {
   wallet: Keypair;
@@ -56,12 +91,7 @@ export interface BotConfig {
 
 export class Bot {
   private readonly poolFilters: PoolFilters;
-
-  // snipe list
   private readonly snipeListCache?: SnipeListCache;
-
-  private readonly MAX_CONCURRENT_TOKENS = 5;
-  private activeTokenCount = 0;
   private readonly mutex: Mutex;
   public readonly isWarp: boolean = false;
   public readonly isJito: boolean = false;
@@ -125,24 +155,16 @@ export class Bot {
       await sleep(this.config.autoBuyDelay);
     }
 
-    await this.mutex.acquire();
-    if (this.activeTokenCount >= this.MAX_CONCURRENT_TOKENS) {
-      logger.debug(
-        { mint: poolState.baseMint.toString() },
-        `Skipping buy because maximum number of concurrent tokens (${this.MAX_CONCURRENT_TOKENS}) is reached`,
-      );
-      this.mutex.release();
-      return;
-    }
-    this.activeTokenCount++;
-    this.mutex.release();
-
     try {
-      const [market, mintAta] = await Promise.all([
-        this.marketStorage.get(poolState.marketId.toString()),
-        getAssociatedTokenAddress(poolState.baseMint, this.config.wallet.publicKey),
-      ]);
+      const market = await this.marketStorage.get(poolState.marketId.toString());
       const poolKeys: LiquidityPoolKeysV4 = createPoolKeys(accountId, poolState, market);
+      
+      const mintAta = await getAssociatedTokenAddress(
+        poolState.baseMint,
+        this.config.wallet.publicKey,
+        false,
+        TOKEN_PROGRAM_ID
+      );
 
       if (!this.config.useSnipeList) {
         const match = await this.filterMatch(poolKeys);
@@ -159,6 +181,7 @@ export class Bot {
             { mint: poolState.baseMint.toString() },
             `Send buy transaction attempt: ${i + 1}/${this.config.maxBuyRetries}`,
           );
+
           const tokenOut = new Token(TOKEN_PROGRAM_ID, poolKeys.baseMint, poolKeys.baseDecimals);
           const result = await this.swap(
             poolKeys,
@@ -207,10 +230,6 @@ export class Bot {
   }
 
   public async sell(accountId: PublicKey, rawAccount: RawAccount) {
-    await this.mutex.acquire();
-    this.activeTokenCount = Math.max(0, this.activeTokenCount - 1);
-    this.mutex.release();
-
     try {
       logger.trace({ mint: rawAccount.mint }, `Processing new token...`);
 
@@ -221,7 +240,9 @@ export class Bot {
         return;
       }
 
-      const tokenIn = new Token(TOKEN_PROGRAM_ID, poolData.state.baseMint, poolData.state.baseDecimal.toNumber());
+      const market = await this.marketStorage.get(poolData.state.marketId.toString());
+      const poolKeys: LiquidityPoolKeysV4 = createPoolKeys(new PublicKey(poolData.id), poolData.state, market);
+      const tokenIn = new Token(poolKeys.programId, poolData.state.baseMint, poolData.state.baseDecimal.toNumber());
       const tokenAmountIn = new TokenAmount(tokenIn, rawAccount.amount, true);
 
       if (tokenAmountIn.isZero()) {
@@ -233,9 +254,6 @@ export class Bot {
         logger.debug({ mint: rawAccount.mint }, `Waiting for ${this.config.autoSellDelay} ms before sell`);
         await sleep(this.config.autoSellDelay);
       }
-
-      const market = await this.marketStorage.get(poolData.state.marketId.toString());
-      const poolKeys: LiquidityPoolKeysV4 = createPoolKeys(new PublicKey(poolData.id), poolData.state, market);
 
       await this.priceMatch(tokenAmountIn, poolKeys);
 
@@ -285,14 +303,9 @@ export class Bot {
       }
     } catch (error) {
       logger.error({ mint: rawAccount.mint.toString(), error }, `Failed to sell token`);
-    } finally {
-      await this.mutex.acquire();
-      this.activeTokenCount = Math.max(0, this.activeTokenCount - 1);
-      this.mutex.release();
     }
   }
 
-  // noinspection JSUnusedLocalSymbols
   private async swap(
     poolKeys: LiquidityPoolKeysV4,
     ataIn: PublicKey,
@@ -303,65 +316,72 @@ export class Bot {
     slippage: number,
     wallet: Keypair,
     direction: 'buy' | 'sell',
-  ) {
-    const slippagePercent = new Percent(slippage, 100);
-    const poolInfo = await Liquidity.fetchInfo({
-      connection: this.connection,
-      poolKeys,
-    });
+  ): Promise<TransactionResult> {
+    try {
+      // Get priority fee from API
+      const { data: priorityFeeData } = await axios.get<{
+        id: string;
+        success: boolean;
+        data: { default: { vh: number; h: number; m: number } };
+      }>(`${API_URLS.BASE_HOST}${API_URLS.PRIORITY_FEE}`);
 
-    const computedAmountOut = Liquidity.computeAmountOut({
-      poolKeys,
-      poolInfo,
-      amountIn,
-      currencyOut: tokenOut,
-      slippage: slippagePercent,
-    });
+      // Compute swap using API
+      const { data: swapResponse } = await axios.get<SwapCompute>(
+        `${API_URLS.SWAP_HOST}/compute/swap-base-in?inputMint=${tokenIn.mint.toBase58()}&outputMint=${tokenOut.mint.toBase58()}&amount=${amountIn.raw.toString()}&slippageBps=${slippage * 100}&txVersion=${this.isWarp ? 'V0' : 'LEGACY'}`
+      );
 
-    const latestBlockhash = await this.connection.getLatestBlockhash();
-    const { innerTransaction } = Liquidity.makeSwapFixedInInstruction(
-      {
-        poolKeys: poolKeys,
-        userKeys: {
-          tokenAccountIn: ataIn,
-          tokenAccountOut: ataOut,
-          owner: wallet.publicKey,
-        },
-        amountIn: amountIn.raw,
-        minAmountOut: computedAmountOut.minAmountOut.raw,
-      },
-      poolKeys.version,
-    );
+      // Get swap transaction from API
+      const { data: swapTransactions } = await axios.post<{
+        id: string;
+        version: string;
+        success: boolean;
+        data: { transaction: string }[];
+      }>(`${API_URLS.SWAP_HOST}/transaction/swap-base-in`, {
+        computeUnitPriceMicroLamports: String(priorityFeeData.data.default.h),
+        swapResponse,
+        txVersion: this.isWarp ? 'V0' : 'LEGACY',
+        wallet: wallet.publicKey.toBase58(),
+        wrapSol: tokenIn.symbol === 'SOL',
+        unwrapSol: tokenOut.symbol === 'SOL',
+        inputAccount: tokenIn.symbol === 'SOL' ? undefined : ataIn.toBase58(),
+        outputAccount: tokenOut.symbol === 'SOL' ? undefined : ataOut.toBase58(),
+      });
 
-    const messageV0 = new TransactionMessage({
-      payerKey: wallet.publicKey,
-      recentBlockhash: latestBlockhash.blockhash,
-      instructions: [
-        ...(this.isWarp || this.isJito
-          ? []
-          : [
-              ComputeBudgetProgram.setComputeUnitPrice({ microLamports: this.config.unitPrice }),
-              ComputeBudgetProgram.setComputeUnitLimit({ units: this.config.unitLimit }),
-            ]),
-        ...(direction === 'buy'
-          ? [
-              createAssociatedTokenAccountIdempotentInstruction(
-                wallet.publicKey,
-                ataOut,
-                wallet.publicKey,
-                tokenOut.mint,
-              ),
-            ]
-          : []),
-        ...innerTransaction.instructions,
-        ...(direction === 'sell' ? [createCloseAccountInstruction(ataIn, wallet.publicKey, wallet.publicKey)] : []),
-      ],
-    }).compileToV0Message();
+      const allTxBuf = swapTransactions.data.map((tx) => Buffer.from(tx.transaction, 'base64'));
+      
+      let result: TransactionResult | undefined;
 
-    const transaction = new VersionedTransaction(messageV0);
-    transaction.sign([wallet, ...innerTransaction.signers]);
+      for (const txBuf of allTxBuf) {
+        const latestBlockhash = await this.connection.getLatestBlockhash();
+        
+        if (this.isWarp) {
+          const transaction = VersionedTransaction.deserialize(txBuf);
+          transaction.sign([wallet]);
+          result = await this.txExecutor.executeAndConfirm(transaction, wallet, latestBlockhash);
+        } else {
+          const transaction = Transaction.from(txBuf);
+          transaction.sign(wallet);
+          const versionedTx = new VersionedTransaction(
+            new TransactionMessage({
+              payerKey: wallet.publicKey,
+              recentBlockhash: latestBlockhash.blockhash,
+              instructions: transaction.instructions,
+            }).compileToV0Message()
+          );
+          versionedTx.sign([wallet]);
+          result = await this.txExecutor.executeAndConfirm(versionedTx, wallet, latestBlockhash);
+        }
 
-    return this.txExecutor.executeAndConfirm(transaction, wallet, latestBlockhash);
+        if (!result.confirmed) {
+          throw new Error(`Transaction failed: ${result.error}`);
+        }
+      }
+
+      return result || { confirmed: false, error: 'No transaction executed' };
+    } catch (error) {
+      logger.error('Swap error:', error);
+      return { confirmed: false, error };
+    }
   }
 
   private async filterMatch(poolKeys: LiquidityPoolKeysV4) {
