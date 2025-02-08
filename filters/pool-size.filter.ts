@@ -23,15 +23,15 @@ export class PoolSizeFilter implements Filter {
 
         // Check if pool size is outside the desired range
         if (poolSizeDecimal > maxSizeDecimal) {
-            return { ok: true, message: `PoolSize -> Pool size ${poolSizeDecimal} > ${maxSizeDecimal}` };
+            return { ok: false, message: `PoolSize -> Pool size ${poolSizeDecimal} > ${maxSizeDecimal}` };
         }
 
         if (poolSizeDecimal < minSizeDecimal) {
-            return { ok: true, message: `PoolSize -> Pool size ${poolSizeDecimal} < ${minSizeDecimal}` };
+            return { ok: false, message: `PoolSize -> Pool size ${poolSizeDecimal} < ${minSizeDecimal}` };
         }
 
         // If we get here, the pool size is within range (between min and max)
-        return { ok: false, message: `PoolSize -> Pool size ${poolSizeDecimal}` };
+        return { ok: true, message: `PoolSize -> Pool size ${poolSizeDecimal} within range` };
     } catch (error) {
         logger.error({ mint: poolKeys.baseMint }, `Failed to check pool size`);
         return { ok: false, message: 'PoolSize -> Failed to check pool size' };

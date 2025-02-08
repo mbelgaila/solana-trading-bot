@@ -29,16 +29,18 @@ export class RenouncedFreezeFilter implements Filter {
       }
 
       const deserialize = MintLayout.decode(accountInfo.data);
-      const renounced = !this.checkRenounced || deserialize.mintAuthorityOption === 0;
-      const freezable = !this.checkFreezable || deserialize.freezeAuthorityOption !== 0;
-      const ok = renounced && !freezable;
+      // If we're checking renounced (checkRenounced=true), then we want mintAuthorityOption=0 (renounced)
+      const renouncedOk = !this.checkRenounced || deserialize.mintAuthorityOption === 0;
+      // If we're checking freezable (checkFreezable=true), then we want freezeAuthorityOption=0 (not freezable)
+      const notFreezableOk = !this.checkFreezable || deserialize.freezeAuthorityOption === 0;
+      const ok = renouncedOk && notFreezableOk;
       const message: string[] = [];
 
-      if (!renounced) {
+      if (!renouncedOk) {
         message.push('mint');
       }
 
-      if (freezable) {
+      if (!notFreezableOk) {
         message.push('freeze');
       }
 
